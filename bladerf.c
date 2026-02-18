@@ -12,7 +12,7 @@
 
 #include "sdr.h"
 
-const int bladerf_gain_val = 30;
+int bladerf_gain_val = 30;
 const unsigned num_transfers = 7;
 
 extern sig_atomic_t running;
@@ -113,6 +113,14 @@ void *bladerf_rx_cb(struct bladerf *bladerf, struct bladerf_stream *stream, stru
         free(s);
 
     return samples;
+}
+
+int bladerf_set_gain_runtime(void *dev, int gain) {
+    struct bladerf *b = (struct bladerf *)dev;
+    int status = bladerf_set_gain(b, BLADERF_CHANNEL_RX(0), gain);
+    if (status == 0)
+        bladerf_gain_val = gain;
+    return status;
 }
 
 void *bladerf_stream_thread(void *arg) {

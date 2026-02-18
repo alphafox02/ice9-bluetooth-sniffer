@@ -1134,6 +1134,9 @@ class DashboardState:
         # Persistence and alerting (set externally after construction)
         self.db = None          # DeviceDB instance
         self.alert_mgr = None   # AlertManager instance
+        # C2 control state
+        self.c2_sensor_status = {}   # sensor_id -> heartbeat data + last_heartbeat
+        self.c2_outbox = queue.Queue()  # (sensor_id_bytes, json_bytes) for ROUTER
 
     def add_packet(self, pkt, gps_info=None, sensor_id=None):
         with self.lock:
@@ -1498,6 +1501,84 @@ class DashboardState:
             if q in self.sse_queues:
                 self.sse_queues.remove(q)
 
+    def update_sensor_c2(self, sensor_id, heartbeat):
+        """Update C2 sensor status from a heartbeat message."""
+        with self.lock:
+            heartbeat["last_heartbeat"] = time.time()
+            self.c2_sensor_status[sensor_id] = heartbeat
+
+    def send_c2_command(self, sensor_id, cmd, params=None):
+        """Queue a C2 command for delivery by the ROUTER thread."""
+        msg = {"cmd": cmd, "req_id": f"r{int(time.time()*1000) % 1000000}"}
+        if params:
+            msg.update(params)
+        self.c2_outbox.put((sensor_id.encode(), json.dumps(msg).encode()))
+
+    def get_sensor_nodes(self):
+        """Return merged sensor list with C2 heartbeat data."""
+        with self.lock:
+            now = time.time()
+            nodes = {}
+            # Start with data-path sensors
+            for sid, s in self.sensors.items():
+                nodes[sid] = {
+                    "id": sid,
+                    "status": "online" if (now - s["last_seen"]) < 15 else
+                              "stale" if (now - s["last_seen"]) < 60 else "offline",
+                    "lat": s["lat"], "lon": s["lon"],
+                    "pkts": s["pkts"], "last_seen": s["last_seen"],
+                    "sdr": None, "center_freq": None, "channels": None,
+                    "gain": None, "squelch": None,
+                    "pkt_rate": None, "crc_pct": None,
+                    "uptime": None, "has_c2": False,
+                }
+            # Merge C2 heartbeat data
+            for sid, hb in self.c2_sensor_status.items():
+                age = now - hb.get("last_heartbeat", 0)
+                status = "online" if age < 15 else "stale" if age < 60 else "offline"
+                if sid in nodes:
+                    n = nodes[sid]
+                    n["has_c2"] = True
+                    n["status"] = status
+                    n["sdr"] = hb.get("sdr")
+                    n["center_freq"] = hb.get("center_freq")
+                    n["channels"] = hb.get("channels")
+                    n["gain"] = hb.get("gain")
+                    n["squelch"] = hb.get("squelch")
+                    n["pkt_rate"] = hb.get("pkt_rate")
+                    n["crc_pct"] = hb.get("crc_pct")
+                    n["uptime"] = hb.get("uptime")
+                    if hb.get("gps"):
+                        n["lat"] = hb["gps"][0]
+                        n["lon"] = hb["gps"][1]
+                else:
+                    nodes[sid] = {
+                        "id": sid, "status": status, "has_c2": True,
+                        "lat": hb.get("gps", [None])[0] if hb.get("gps") else None,
+                        "lon": hb.get("gps", [None, None])[1] if hb.get("gps") else None,
+                        "pkts": 0, "last_seen": hb.get("last_heartbeat", 0),
+                        "sdr": hb.get("sdr"),
+                        "center_freq": hb.get("center_freq"),
+                        "channels": hb.get("channels"),
+                        "gain": hb.get("gain"),
+                        "squelch": hb.get("squelch"),
+                        "pkt_rate": hb.get("pkt_rate"),
+                        "crc_pct": hb.get("crc_pct"),
+                        "uptime": hb.get("uptime"),
+                    }
+            # Add static positions that haven't been seen
+            for label, (lat, lon) in self.static_positions.items():
+                if label not in nodes:
+                    nodes[label] = {
+                        "id": label, "status": "offline", "has_c2": False,
+                        "lat": lat, "lon": lon,
+                        "pkts": 0, "last_seen": 0,
+                        "sdr": None, "center_freq": None, "channels": None,
+                        "gain": None, "squelch": None,
+                        "pkt_rate": None, "crc_pct": None, "uptime": None,
+                    }
+            return list(nodes.values())
+
 
 # ---------------------------------------------------------------------------
 # HTTP server
@@ -1521,6 +1602,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_json(state.get_summary())
         elif path == "/api/sensors":
             self._serve_json(state.get_sensors())
+        elif path == "/api/nodes":
+            self._serve_json(state.get_sensor_nodes())
         elif path == "/api/export.csv":
             self._serve_csv()
         elif path == "/api/export.json":
@@ -1544,6 +1627,50 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_json({"ok": True})
             except Exception:
                 self.send_error(400)
+        elif path.startswith("/api/c2/"):
+            self._handle_c2(path)
+        else:
+            self.send_error(404)
+
+    def _handle_c2(self, path):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+        except Exception:
+            self.send_error(400)
+            return
+
+        sensor_id = body.get("sensor_id", "")
+        if not sensor_id:
+            self._serve_json({"ok": False, "error": "sensor_id required"})
+            return
+
+        if path == "/api/c2/set_gain":
+            params = {}
+            if "gain" in body:
+                params["gain"] = float(body["gain"])
+            if "lna" in body:
+                params["lna"] = int(body["lna"])
+            if "vga" in body:
+                params["vga"] = int(body["vga"])
+            state.send_c2_command(sensor_id, "set_gain", params)
+            self._serve_json({"ok": True})
+        elif path == "/api/c2/set_squelch":
+            threshold = float(body.get("threshold", -45))
+            state.send_c2_command(sensor_id, "set_squelch",
+                                  {"threshold": threshold})
+            self._serve_json({"ok": True})
+        elif path == "/api/c2/restart":
+            params = {}
+            if "center_freq" in body:
+                params["center_freq"] = int(body["center_freq"])
+            if "channels" in body:
+                params["channels"] = int(body["channels"])
+            state.send_c2_command(sensor_id, "restart", params)
+            self._serve_json({"ok": True})
+        elif path == "/api/c2/get_status":
+            state.send_c2_command(sensor_id, "get_status")
+            self._serve_json({"ok": True})
         else:
             self.send_error(404)
 
@@ -1615,12 +1742,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 stats = state.get_stats()
                 summary = state.get_summary()
                 sensors = state.get_sensors()
+                nodes = state.get_sensor_nodes()
                 alerts = []
                 if state.alert_mgr:
                     alerts = state.alert_mgr.get_pending_alerts()
                 payload = json.dumps({"stats": stats, "devices": devs,
                                       "summary": summary, "sensors": sensors,
-                                      "alerts": alerts})
+                                      "nodes": nodes, "alerts": alerts})
                 self.wfile.write(f"event: update\ndata: {payload}\n\n".encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionError, OSError):
@@ -1797,6 +1925,77 @@ def parse_server_pubkey(path):
     raise ValueError(f"No public key found in {path}")
 
 
+def control_router_thread(data_port, server_key_path):
+    """ROUTER thread for C2 control channel. Binds on data_port + 1."""
+    control_port = data_port + 1
+    ctx = zmq.Context()
+    router = ctx.socket(zmq.ROUTER)
+
+    if server_key_path:
+        server_public_key = parse_server_pubkey(server_key_path)
+        router.setsockopt(zmq.CURVE_SERVER, 1)
+        # ROUTER is CURVE server -- needs server secret key
+        # For simplicity, read both public and secret from the keyfile
+        with open(server_key_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("secret_key="):
+                    router.setsockopt(zmq.CURVE_SECRETKEY,
+                                      line.split("=", 1)[1].encode())
+                elif line.startswith("public_key=") or line.startswith("server_public_key="):
+                    router.setsockopt(zmq.CURVE_PUBLICKEY,
+                                      line.split("=", 1)[1].encode())
+
+    router.bind(f"tcp://*:{control_port}")
+    print(f"  C2 control: tcp://*:{control_port} (ROUTER)", file=sys.stderr)
+
+    poller = zmq.Poller()
+    poller.register(router, zmq.POLLIN)
+
+    while running:
+        try:
+            ready = dict(poller.poll(1000))
+        except zmq.ZMQError:
+            break
+
+        # Receive heartbeats from sensors
+        if router in ready:
+            try:
+                frames = router.recv_multipart(zmq.NOBLOCK)
+                if len(frames) >= 2:
+                    identity = frames[0]
+                    payload = frames[-1]
+                    try:
+                        msg = json.loads(payload)
+                        msg_type = msg.get("type", "")
+                        if msg_type == "heartbeat":
+                            sensor_id = msg.get("sensor_id",
+                                                identity.decode("utf-8", "replace"))
+                            state.update_sensor_c2(sensor_id, msg)
+                        elif msg_type == "response":
+                            pass  # could log C2 responses
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+            except zmq.Again:
+                pass
+
+        # Drain command outbox and send via ROUTER
+        while not state.c2_outbox.empty():
+            try:
+                sensor_id_bytes, cmd_bytes = state.c2_outbox.get_nowait()
+                # Find the ROUTER identity for this sensor_id
+                # The sensor's DEALER identity IS the sensor_id string
+                router.send_multipart([sensor_id_bytes, cmd_bytes])
+            except queue.Empty:
+                break
+            except zmq.ZMQError as e:
+                print(f"  C2 send error: {e}", file=sys.stderr)
+                break
+
+    router.close()
+    ctx.term()
+
+
 # ---------------------------------------------------------------------------
 # Dashboard HTML (self-contained, no external deps except Leaflet CDN for map)
 # ---------------------------------------------------------------------------
@@ -1892,6 +2091,17 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
            font-size: 9px; border: 1px solid #333; }
 .export-bar { padding: 4px 8px; background: #202020; border-top: 1px solid #333;
               display: flex; gap: 8px; align-items: center; font-size: 11px; }
+/* Nodes panel */
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+.dot-online { background: #4c4; }
+.dot-stale { background: #cc4; }
+.dot-offline { background: #c44; }
+.node-ctrl { display: flex; align-items: center; gap: 6px; }
+.node-ctrl input[type=range] { width: 80px; accent-color: #68f; }
+.node-ctrl input[type=number] { width: 60px; font: 11px monospace; background: #333;
+  color: #ccc; border: 1px solid #555; padding: 1px 3px; }
+.node-ctrl button { font-size: 10px; padding: 1px 6px; }
+.node-ctrl .val-label { font-size: 10px; color: #888; min-width: 30px; text-align: right; }
 @media (max-width: 900px) {
   .summary-grid { grid-template-columns: 1fr; }
   .summary-card.wide, .summary-card.full { grid-column: span 1; }
@@ -1906,6 +2116,7 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
   <div class="tabs" id="tabBar">
     <div class="tab active" data-tab="devices" onclick="switchTab('devices')">devices</div>
     <div class="tab" data-tab="summary" onclick="switchTab('summary')">summary</div>
+    <div class="tab" data-tab="nodes" onclick="switchTab('nodes')">nodes</div>
   </div>
   <select class="filter" id="protoFilter" onchange="renderDevices()" title="Protocol filter">
     <option value="all">all</option>
@@ -1968,6 +2179,29 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
 
 <div class="panel" id="panelMap">
   <div id="map"></div>
+</div>
+
+<div class="panel" id="panelNodes">
+  <div class="table-area">
+    <table>
+      <thead><tr>
+        <th>status</th>
+        <th>sensor</th>
+        <th>sdr</th>
+        <th>freq (MHz)</th>
+        <th>channels</th>
+        <th>gain</th>
+        <th>squelch</th>
+        <th>pkt rate</th>
+        <th>crc %</th>
+        <th>uptime</th>
+        <th>gps</th>
+        <th>controls</th>
+      </tr></thead>
+      <tbody id="nodesTb"></tbody>
+    </table>
+    <div class="empty" id="nodesEmpty">no sensor nodes connected</div>
+  </div>
 </div>
 
 <script>
@@ -2344,13 +2578,121 @@ function toggleWatch(mac) {
   }).catch(()=>{});
 }
 
+/* --- Nodes tab --- */
+let nodesData = [];
+
+function c2Post(endpoint, body) {
+  fetch(endpoint, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: {'Content-Type': 'application/json'}
+  }).catch(()=>{});
+}
+
+function c2SetGain(sensorId, sdr, val, which) {
+  const body = {sensor_id: sensorId};
+  if (sdr === 'hackrf') {
+    body[which] = parseInt(val);
+  } else {
+    body.gain = parseFloat(val);
+  }
+  c2Post('/api/c2/set_gain', body);
+}
+
+function c2SetSquelch(sensorId, val) {
+  c2Post('/api/c2/set_squelch', {sensor_id: sensorId, threshold: parseFloat(val)});
+}
+
+function c2Restart(sensorId) {
+  const freqEl = document.getElementById('restart-freq-'+sensorId);
+  const chEl = document.getElementById('restart-ch-'+sensorId);
+  const params = {sensor_id: sensorId};
+  if (freqEl && freqEl.value) params.center_freq = parseInt(freqEl.value);
+  if (chEl && chEl.value) params.channels = parseInt(chEl.value);
+  if (!confirm('Restart sensor "'+sensorId+'"? This will briefly disconnect it.')) return;
+  c2Post('/api/c2/restart', params);
+}
+
+function c2GetStatus(sensorId) {
+  c2Post('/api/c2/get_status', {sensor_id: sensorId});
+}
+
+function renderNodes() {
+  const ntb = document.getElementById('nodesTb');
+  const empty = document.getElementById('nodesEmpty');
+  if (!nodesData.length) { ntb.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  const frag = document.createDocumentFragment();
+  for (const n of nodesData) {
+    const tr = document.createElement('tr');
+    const dotCls = n.status === 'online' ? 'dot-online' : n.status === 'stale' ? 'dot-stale' : 'dot-offline';
+    const gps = (n.lat != null && n.lon != null) ? n.lat.toFixed(4)+', '+n.lon.toFixed(4) : '-';
+    const rate = n.pkt_rate != null ? n.pkt_rate.toFixed(1) : '-';
+    const crc = n.crc_pct != null ? n.crc_pct.toFixed(1)+'%' : '-';
+    const up = n.uptime != null ? fmtUp(n.uptime) : '-';
+    let gainHtml = '-';
+    if (n.has_c2 && n.gain != null) {
+      const sid = n.id.replace(/[^a-zA-Z0-9_-]/g,'_');
+      if (n.sdr === 'hackrf' && n.gain.lna != null) {
+        gainHtml = '<div class="node-ctrl">' +
+          'LNA <input type="range" min="0" max="40" step="8" value="'+n.gain.lna+'" ' +
+          'onchange="c2SetGain(\''+n.id+'\',\'hackrf\',this.value,\'lna\')">' +
+          '<span class="val-label" id="gl-'+sid+'">'+n.gain.lna+'</span>' +
+          'VGA <input type="range" min="0" max="62" step="2" value="'+n.gain.vga+'" ' +
+          'onchange="c2SetGain(\''+n.id+'\',\'hackrf\',this.value,\'vga\')">' +
+          '<span class="val-label" id="gv-'+sid+'">'+n.gain.vga+'</span></div>';
+      } else {
+        const gv = n.gain.value != null ? n.gain.value : n.gain;
+        gainHtml = '<div class="node-ctrl">' +
+          '<input type="range" min="0" max="76" step="1" value="'+gv+'" ' +
+          'onchange="c2SetGain(\''+n.id+'\',\''+n.sdr+'\',this.value,\'gain\')">' +
+          '<span class="val-label">'+gv+'</span></div>';
+      }
+    }
+    let sqlHtml = '-';
+    if (n.has_c2 && n.squelch != null) {
+      sqlHtml = '<div class="node-ctrl">' +
+        '<input type="range" min="-80" max="-10" step="1" value="'+n.squelch+'" ' +
+        'onchange="c2SetSquelch(\''+n.id+'\',this.value)">' +
+        '<span class="val-label">'+n.squelch+'</span></div>';
+    }
+    let ctrlHtml = '';
+    if (n.has_c2) {
+      const sid = n.id.replace(/[^a-zA-Z0-9_-]/g,'_');
+      ctrlHtml = '<div class="node-ctrl">' +
+        '<input type="number" id="restart-freq-'+sid+'" placeholder="freq" value="'+(n.center_freq||'')+'" style="width:55px">' +
+        '<input type="number" id="restart-ch-'+sid+'" placeholder="ch" value="'+(n.channels||'')+'" style="width:40px">' +
+        '<button onclick="c2Restart(\''+n.id+'\')" style="color:#f88">restart</button>' +
+        '<button onclick="c2GetStatus(\''+n.id+'\')">refresh</button></div>';
+    }
+    tr.innerHTML =
+      '<td><span class="dot '+dotCls+'"></span>'+n.status+'</td>' +
+      '<td>'+n.id+'</td>' +
+      '<td>'+(n.sdr||'-')+'</td>' +
+      '<td>'+(n.center_freq||'-')+'</td>' +
+      '<td>'+(n.channels||'-')+'</td>' +
+      '<td>'+gainHtml+'</td>' +
+      '<td>'+sqlHtml+'</td>' +
+      '<td>'+rate+'</td>' +
+      '<td>'+crc+'</td>' +
+      '<td>'+up+'</td>' +
+      '<td class="dim">'+gps+'</td>' +
+      '<td>'+ctrlHtml+'</td>';
+    frag.appendChild(tr);
+  }
+  ntb.innerHTML = '';
+  ntb.appendChild(frag);
+}
+
 es.addEventListener('update', e => {
   const d = JSON.parse(e.data);
   devices = d.devices;
   summary = d.summary;
+  if (d.nodes) nodesData = d.nodes;
   updStats(d.stats);
   renderDevices();
   if (curTab === 'summary') renderSummary(summary);
+  if (curTab === 'nodes') renderNodes();
   if (d.sensors && map) updateSensors(d.sensors);
   if (devices && map) updateDevicePositions(devices);
   // Browser alerts
@@ -2494,6 +2836,24 @@ def main():
     )
     zmq_thread.start()
 
+    # Start C2 ROUTER thread when in bind mode (sensors connect to us)
+    c2_thread = None
+    c2_port = None
+    if args.bind:
+        # Derive C2 port from first endpoint's port + 1
+        try:
+            ep = args.endpoints[0]
+            parsed = urlparse(ep.replace("tcp://", "http://"))
+            c2_port = (parsed.port or 5555) + 1
+        except Exception:
+            c2_port = 5556
+        c2_thread = threading.Thread(
+            target=control_router_thread,
+            args=(c2_port - 1, args.server_key),
+            daemon=True,
+        )
+        c2_thread.start()
+
     # Start HTTP server
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), DashboardHandler)
     httpd.timeout = 1
@@ -2516,6 +2876,9 @@ def main():
     if static_positions:
         for label, (lat, lon) in static_positions.items():
             print(f"  Sensor pos: {label} ({lat}, {lon})", file=sys.stderr)
+    if c2_port:
+        print(f"  C2 control: tcp://*:{c2_port} (ROUTER, sensors connect here)",
+              file=sys.stderr)
     print(f"  {'='*40}\n", file=sys.stderr)
 
     try:
@@ -2527,6 +2890,8 @@ def main():
     running = False
     print("\nShutting down...", file=sys.stderr)
     zmq_thread.join(timeout=3)
+    if c2_thread:
+        c2_thread.join(timeout=3)
     httpd.server_close()
 
     if pcap_file:

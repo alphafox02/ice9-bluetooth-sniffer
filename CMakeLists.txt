@@ -197,10 +197,13 @@ if (SOAPYSDR_FOUND)
 endif()
 
 if (ZMQ_FOUND)
+    target_sources(ice9-bluetooth PRIVATE
+        ${PROJECT_SOURCE_DIR}/control.c
+        ${PROJECT_SOURCE_DIR}/cjson/cJSON.c)
+    target_include_directories(ice9-bluetooth PRIVATE ${ZMQ_INCLUDE_DIRS} ${PROJECT_SOURCE_DIR}/cjson)
     target_link_libraries(ice9-bluetooth PRIVATE ${ZMQ_LIBRARIES})
-    target_include_directories(ice9-bluetooth PRIVATE ${ZMQ_INCLUDE_DIRS})
     target_compile_definitions(ice9-bluetooth PRIVATE HAVE_ZMQ)
-    message(STATUS "ZeroMQ found: enabling --zmq-pub packet streaming")
+    message(STATUS "ZeroMQ found: enabling --zmq-pub packet streaming and C2 control")
 endif()
 
 if (GPS_FOUND)

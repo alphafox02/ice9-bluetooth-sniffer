@@ -7,10 +7,13 @@
 
 #include <uhd.h>
 
+extern float usrp_gain_val;
+
 void usrp_list(void);
 uhd_usrp_handle usrp_setup(char *serial);
 char *usrp_get_serial(char *name);
 void *usrp_stream_thread(void *arg);
 void usrp_close(uhd_usrp_handle usrp);
+int usrp_set_gain_runtime(void *dev, double gain);
 
 #endif

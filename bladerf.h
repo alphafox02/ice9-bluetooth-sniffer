@@ -7,8 +7,11 @@
 
 #include <libbladeRF.h>
 
+extern int bladerf_gain_val;
+
 void bladerf_list(void);
 struct bladerf *bladerf_setup(int id);
 void *bladerf_stream_thread(void *arg);
+int bladerf_set_gain_runtime(void *dev, int gain);
 
 #endif
