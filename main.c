@@ -79,7 +79,6 @@ int stats = 0;
 int check_crc = 0;
 #ifdef HAVE_ZMQ
 int zmq_pub_active = 0;
-int zmq_connect_mode = 0;
 char *zmq_endpoint = NULL;
 char *zmq_curve_keyfile = NULL;
 char *sensor_id = NULL;
@@ -660,9 +659,8 @@ int main(int argc, char **argv) {
 
 #ifdef HAVE_ZMQ
     if (zmq_pub_active) {
-        if (zmq_pub_init(zmq_endpoint, zmq_curve_keyfile, zmq_connect_mode) != 0)
-            errx(1, "Failed to %s ZMQ PUB socket on %s",
-                 zmq_connect_mode ? "connect" : "bind", zmq_endpoint);
+        if (zmq_pub_init(zmq_endpoint, zmq_curve_keyfile) != 0)
+            errx(1, "Failed to connect ZMQ PUB socket to %s", zmq_endpoint);
         if (sensor_id == NULL) {
             sensor_id = malloc(256);
             if (gethostname(sensor_id, 256) != 0)
@@ -671,8 +669,7 @@ int main(int argc, char **argv) {
             if (strlen(sensor_id) == 24)
                 strcat(sensor_id, "-");
         }
-        fprintf(stderr, "ZMQ PUB: %s (%s) sensor-id=%s\n", zmq_endpoint,
-                zmq_connect_mode ? "connect" : "bind", sensor_id);
+        fprintf(stderr, "ZMQ PUB: %s sensor-id=%s\n", zmq_endpoint, sensor_id);
     }
 #endif
 
@@ -730,7 +727,7 @@ int main(int argc, char **argv) {
     init_threads(!live);
 
 #ifdef HAVE_ZMQ
-    if (zmq_pub_active && zmq_connect_mode) {
+    if (zmq_pub_active) {
         char *ctrl_ep = control_derive_endpoint(zmq_endpoint);
         sdr_handle_t sdr = { .type = SDR_NONE, .handle = NULL };
         if (hackrf != NULL)      { sdr.type = SDR_HACKRF;  sdr.handle = hackrf; }
@@ -810,13 +807,12 @@ int main(int argc, char **argv) {
 #endif
 
 #ifdef HAVE_ZMQ
-    if (zmq_pub_active && zmq_connect_mode) {
+    if (zmq_pub_active) {
         control_shutdown();
         pthread_join(control_thread, NULL);
         control_close();
-    }
-    if (zmq_pub_active)
         zmq_pub_close();
+    }
     free(zmq_endpoint);
     free(zmq_curve_keyfile);
 #endif

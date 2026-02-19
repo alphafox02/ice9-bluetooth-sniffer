@@ -46,7 +46,6 @@ extern int stats;
 extern int check_crc;
 #ifdef HAVE_ZMQ
 extern int zmq_pub_active;
-extern int zmq_connect_mode;
 extern char *zmq_endpoint;
 extern char *zmq_curve_keyfile;
 extern char *sensor_id;
@@ -152,8 +151,7 @@ void parse_options(int argc, char **argv) {
         { "stats", no_argument, NULL, 's' },
         { "check-crc", no_argument, NULL, 'r' },
 #ifdef HAVE_ZMQ
-        { "zmq-pub", required_argument, NULL, 'Z' },
-        { "zmq-connect", required_argument, NULL, 'X' },
+        { "zmq", required_argument, NULL, 'Z' },
         { "zmq-curve-key", required_argument, NULL, 'K' },
         { "sensor-id", required_argument, NULL, 0x100 },
 #endif
@@ -166,7 +164,7 @@ void parse_options(int argc, char **argv) {
 
     while ((ch = getopt_long(argc, argv, "li:w:C:c:f:aIvsrh"
 #ifdef HAVE_ZMQ
-                             "Z:X:K:"
+                             "Z:K:"
 #endif
 #ifdef HAVE_GPS
                              "G"
@@ -240,13 +238,6 @@ void parse_options(int argc, char **argv) {
             case 'Z':
                 zmq_endpoint = strdup(optarg);
                 zmq_pub_active = 1;
-                zmq_connect_mode = 0;
-                break;
-
-            case 'X':
-                zmq_endpoint = strdup(optarg);
-                zmq_pub_active = 1;
-                zmq_connect_mode = 1;
                 break;
 
             case 'K':

@@ -196,7 +196,7 @@ static int parse_curve_keyfile(const char *path, char *public_key, char *secret_
     return (got_pub && got_sec) ? 0 : -1;
 }
 
-int zmq_pub_init(const char *endpoint, const char *curve_keyfile, int connect_mode) {
+int zmq_pub_init(const char *endpoint, const char *curve_keyfile) {
     zmq_ctx = zmq_ctx_new();
     if (!zmq_ctx)
         return -1;
@@ -226,13 +226,7 @@ int zmq_pub_init(const char *endpoint, const char *curve_keyfile, int connect_mo
         fprintf(stderr, "ZMQ CURVE: encrypted (server key: %.8s...)\n", public_key);
     }
 
-    int rc;
-    if (connect_mode)
-        rc = zmq_connect(zmq_pub, endpoint);
-    else
-        rc = zmq_bind(zmq_pub, endpoint);
-
-    if (rc != 0) {
+    if (zmq_connect(zmq_pub, endpoint) != 0) {
         zmq_close(zmq_pub);
         zmq_ctx_destroy(zmq_ctx);
         zmq_pub = NULL;

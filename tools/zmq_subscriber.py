@@ -3,30 +3,25 @@
 """
 ZMQ subscriber test harness for ice9-bluetooth-sniffer.
 
-Connects to the ZMQ PUB socket and receives BLE packets as PCAP records.
-Can display live packet info, write to a PCAP file, or both.
+Binds a SUB socket and receives BLE/BT packets as PCAP records from
+connecting sensors. Can display live packet info, write to a PCAP file,
+or both.
 
 Usage:
-    # Display live packets from a local sensor:
-    python3 zmq_subscriber.py tcp://localhost:5555
+    # Display live packets (sensors connect to us on port 5555):
+    python3 zmq_subscriber.py tcp://*:5555
 
     # Write to PCAP file:
-    python3 zmq_subscriber.py tcp://localhost:5555 -w output.pcap
-
-    # Subscribe to multiple sensors:
-    python3 zmq_subscriber.py tcp://sensor1:5555 tcp://sensor2:5555
+    python3 zmq_subscriber.py tcp://*:5555 -w output.pcap
 
     # Quiet mode (only write PCAP, no terminal output):
-    python3 zmq_subscriber.py tcp://localhost:5555 -w output.pcap -q
+    python3 zmq_subscriber.py tcp://*:5555 -w output.pcap -q
 
     # Encrypted connection (CURVE):
-    python3 zmq_subscriber.py tcp://sensor1:5555 --server-key server.key.pub
+    python3 zmq_subscriber.py tcp://*:5555 --server-key server.key
 
     # Write PCAP with GPS tagging (PPI headers, DLT 192):
-    python3 zmq_subscriber.py tcp://sensor:5555 -w output.pcap --gps
-
-    # Collector mode (sensors connect to us):
-    python3 zmq_subscriber.py tcp://*:5555 --bind
+    python3 zmq_subscriber.py tcp://*:5555 -w output.pcap --gps
 
 Requirements:
     pip install pyzmq
@@ -227,8 +222,6 @@ def main():
                         help="Server public key file for CURVE encryption")
     parser.add_argument("--gps", action="store_true",
                         help="Write PCAP with PPI GPS headers (DLT 192)")
-    parser.add_argument("--bind", action="store_true",
-                        help="Bind SUB socket (sensors connect to us) instead of connecting")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -249,14 +242,9 @@ def main():
             print(f"CURVE encryption enabled", file=sys.stderr)
 
     for endpoint in args.endpoints:
-        if args.bind:
-            sub.bind(endpoint)
-            if not args.quiet:
-                print(f"Listening on {endpoint} (bind mode)", file=sys.stderr)
-        else:
-            sub.connect(endpoint)
-            if not args.quiet:
-                print(f"Connected to {endpoint}", file=sys.stderr)
+        sub.bind(endpoint)
+        if not args.quiet:
+            print(f"Listening on {endpoint}", file=sys.stderr)
 
     pcap_file = None
     if args.write:

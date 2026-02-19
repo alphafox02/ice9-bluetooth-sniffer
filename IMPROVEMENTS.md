@@ -329,8 +329,7 @@ multilateration (position estimation from distance circles).
 **Dashboard side:**
 - Frame parser handles all 4 ZMQ frame formats (legacy 1-frame, legacy
   2-frame GPS, new 2-frame with sensor ID, new 3-frame with both)
-- Per-endpoint SUB sockets with `zmq.Poller` in connect mode, so the
-  dashboard knows which endpoint each packet came from
+- Dashboard binds SUB socket; sensors connect to it
 - Per-sensor state tracking: GPS position, packet count, last seen
 - Per-device-per-sensor RSSI tracking for distance estimation
 - New `/api/sensors` endpoint returns sensor positions and stats
@@ -374,15 +373,15 @@ multilateration (position estimation from distance circles).
 
 **Usage:**
 ```bash
-# Sensor 1 (has GPS):
-ice9-bluetooth -l -c 2441 -C 60 --zmq-pub tcp://*:5555 --check-crc --sensor-id roof
-
-# Sensor 2 (no GPS, static position):
-ice9-bluetooth -l -c 2441 -C 60 --zmq-pub tcp://*:5556 --check-crc --sensor-id lobby
-
-# Dashboard with multilateration:
-python3 tools/zmq_web_dashboard.py tcp://sensor1:5555 tcp://sensor2:5556 \
+# Dashboard (binds, sensors connect to it):
+python3 tools/zmq_web_dashboard.py tcp://*:5555 \
     --gps --sensor-pos lobby:37.7751,-122.4190
+
+# Sensor 1 (has GPS):
+ice9-bluetooth -l -c 2441 -C 60 --zmq tcp://collector:5555 --check-crc --sensor-id roof
+
+# Sensor 2 (no GPS, static position set on dashboard):
+ice9-bluetooth -l -c 2441 -C 60 --zmq tcp://collector:5555 --check-crc --sensor-id lobby
 ```
 
 ## Files Modified (Multilateration)

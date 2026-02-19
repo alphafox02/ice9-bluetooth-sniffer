@@ -3,35 +3,32 @@
 """
 Live web dashboard for ice9-bluetooth-sniffer ZMQ streams.
 
-Connects to one or more ZMQ PUB endpoints and presents a Kismet-style device
-list with BLE device fingerprinting, CRC-gated tracking, and aggregate
-summaries. Features a privacy toggle to mask MAC addresses (useful for video
-recording / streaming).
+Binds SUB and C2 ROUTER sockets; sensors connect to us. Presents a
+Kismet-style device list with BLE device fingerprinting, CRC-gated
+tracking, aggregate summaries, and per-sensor C2 controls. Features a
+privacy toggle to mask MAC addresses (useful for video/streaming).
 
 Usage:
-    # Basic - connect to local sensor:
-    python3 zmq_web_dashboard.py tcp://localhost:5555
+    # Basic - listen for sensors on port 5555 (C2 auto-binds on 5556):
+    python3 zmq_web_dashboard.py tcp://*:5555
 
-    # Multiple sensors:
-    python3 zmq_web_dashboard.py tcp://sensor1:5555 tcp://sensor2:5555
-
-    # Custom port:
-    python3 zmq_web_dashboard.py tcp://localhost:5555 --port 8080
+    # Custom HTTP port:
+    python3 zmq_web_dashboard.py tcp://*:5555 --port 8080
 
     # With GPS map:
-    python3 zmq_web_dashboard.py tcp://sensor:5555 --gps
+    python3 zmq_web_dashboard.py tcp://*:5555 --gps
 
     # Encrypted connection:
-    python3 zmq_web_dashboard.py tcp://sensor:5555 --server-key server.key.pub
+    python3 zmq_web_dashboard.py tcp://*:5555 --server-key server.key
 
     # Also write PCAP while viewing dashboard:
-    python3 zmq_web_dashboard.py tcp://localhost:5555 -w capture.pcap --gps
+    python3 zmq_web_dashboard.py tcp://*:5555 -w capture.pcap --gps
 
     # Update Bluetooth device database (Nordic Semiconductor, MIT licensed):
-    python3 zmq_web_dashboard.py tcp://localhost:5555 --update-bt-db
+    python3 zmq_web_dashboard.py tcp://*:5555 --update-bt-db
 
     # RPA resolution with Identity Resolving Keys:
-    python3 zmq_web_dashboard.py tcp://localhost:5555 --irk-file irks.txt
+    python3 zmq_web_dashboard.py tcp://*:5555 --irk-file irks.txt
 
 Requirements:
     pip install pyzmq
@@ -1843,72 +1840,32 @@ def _process_zmq_message(frames, pcap_file, use_gps, fallback_sensor_id=None):
         state.add_packet(pkt, gps_info, sensor_id)
 
 
-def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps, bind_mode=False):
+def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps):
+    """Bind SUB socket(s) and receive packets from connecting sensors."""
     ctx = zmq.Context()
+    sub = ctx.socket(zmq.SUB)
+    sub.setsockopt(zmq.SUBSCRIBE, b"")
+    sub.setsockopt(zmq.RCVTIMEO, 1000)
+    if server_key_path:
+        server_public_key = parse_server_pubkey(server_key_path)
+        client_public, client_secret = zmq.curve_keypair()
+        sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
+        sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
+        sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
+    for ep in endpoints:
+        sub.bind(ep)
+        print(f"  Listening on {ep}", file=sys.stderr)
 
-    if bind_mode:
-        # Bind mode: single socket, sensor ID comes from ZMQ frame
-        sub = ctx.socket(zmq.SUB)
-        sub.setsockopt(zmq.SUBSCRIBE, b"")
-        sub.setsockopt(zmq.RCVTIMEO, 1000)
-        if server_key_path:
-            server_public_key = parse_server_pubkey(server_key_path)
-            client_public, client_secret = zmq.curve_keypair()
-            sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
-            sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
-            sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
-        for ep in endpoints:
-            sub.bind(ep)
-            print(f"  Listening on {ep} (bind mode)", file=sys.stderr)
+    while running:
+        try:
+            frames = sub.recv_multipart()
+        except zmq.Again:
+            continue
+        except zmq.ZMQError:
+            break
+        _process_zmq_message(frames, pcap_file, use_gps)
 
-        while running:
-            try:
-                frames = sub.recv_multipart()
-            except zmq.Again:
-                continue
-            except zmq.ZMQError:
-                break
-            _process_zmq_message(frames, pcap_file, use_gps)
-
-        sub.close()
-    else:
-        # Connect mode: one socket per endpoint for sensor identification
-        poller = zmq.Poller()
-        sockets = {}  # socket -> endpoint label
-        for ep in endpoints:
-            sub = ctx.socket(zmq.SUB)
-            sub.setsockopt(zmq.SUBSCRIBE, b"")
-            sub.setsockopt(zmq.RCVTIMEO, 1000)
-            if server_key_path:
-                server_public_key = parse_server_pubkey(server_key_path)
-                client_public, client_secret = zmq.curve_keypair()
-                sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
-                sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
-                sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
-            sub.connect(ep)
-            sockets[sub] = ep
-            poller.register(sub, zmq.POLLIN)
-            print(f"  Connected to {ep}", file=sys.stderr)
-
-        while running:
-            try:
-                ready = dict(poller.poll(1000))
-            except zmq.ZMQError:
-                break
-
-            for sock, label in sockets.items():
-                if sock not in ready:
-                    continue
-                try:
-                    frames = sock.recv_multipart(zmq.NOBLOCK)
-                except zmq.Again:
-                    continue
-                _process_zmq_message(frames, pcap_file, use_gps,
-                                     fallback_sensor_id=label)
-
-        for sock in sockets:
-            sock.close()
-
+    sub.close()
     ctx.term()
 
 
@@ -2731,8 +2688,6 @@ def main():
                         help="Enable GPS column and map display")
     parser.add_argument("--server-key", metavar="FILE",
                         help="Server public key file for CURVE encryption")
-    parser.add_argument("--bind", action="store_true",
-                        help="Bind SUB socket (sensors connect to us) instead of connecting")
     parser.add_argument("--update-bt-db", action="store_true",
                         help="Download/update Bluetooth numbers database from Nordic Semiconductor, then run")
     parser.add_argument("--irk-file", metavar="FILE",
@@ -2828,31 +2783,27 @@ def main():
         pcap_file.write(PCAP_GLOBAL_HDR.pack(0xA1B2C3D4, 2, 4, 0, 0, snaplen, DLT_PPI))
         pcap_file.flush()
 
-    # Start ZMQ receiver thread
+    # Start ZMQ receiver thread (always binds, sensors connect to us)
     zmq_thread = threading.Thread(
         target=zmq_receiver,
-        args=(args.endpoints, args.server_key, pcap_file, args.gps, args.bind),
+        args=(args.endpoints, args.server_key, pcap_file, args.gps),
         daemon=True,
     )
     zmq_thread.start()
 
-    # Start C2 ROUTER thread when in bind mode (sensors connect to us)
-    c2_thread = None
-    c2_port = None
-    if args.bind:
-        # Derive C2 port from first endpoint's port + 1
-        try:
-            ep = args.endpoints[0]
-            parsed = urlparse(ep.replace("tcp://", "http://"))
-            c2_port = (parsed.port or 5555) + 1
-        except Exception:
-            c2_port = 5556
-        c2_thread = threading.Thread(
-            target=control_router_thread,
-            args=(c2_port - 1, args.server_key),
-            daemon=True,
-        )
-        c2_thread.start()
+    # Start C2 ROUTER thread (control port = data port + 1)
+    try:
+        ep = args.endpoints[0]
+        parsed = urlparse(ep.replace("tcp://", "http://"))
+        c2_port = (parsed.port or 5555) + 1
+    except Exception:
+        c2_port = 5556
+    c2_thread = threading.Thread(
+        target=control_router_thread,
+        args=(c2_port - 1, args.server_key),
+        daemon=True,
+    )
+    c2_thread.start()
 
     # Start HTTP server
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), DashboardHandler)
@@ -2876,9 +2827,8 @@ def main():
     if static_positions:
         for label, (lat, lon) in static_positions.items():
             print(f"  Sensor pos: {label} ({lat}, {lon})", file=sys.stderr)
-    if c2_port:
-        print(f"  C2 control: tcp://*:{c2_port} (ROUTER, sensors connect here)",
-              file=sys.stderr)
+    print(f"  C2 control: tcp://*:{c2_port} (ROUTER, sensors connect here)",
+          file=sys.stderr)
     print(f"  {'='*40}\n", file=sys.stderr)
 
     try:
@@ -2890,8 +2840,7 @@ def main():
     running = False
     print("\nShutting down...", file=sys.stderr)
     zmq_thread.join(timeout=3)
-    if c2_thread:
-        c2_thread.join(timeout=3)
+    c2_thread.join(timeout=3)
     httpd.server_close()
 
     if pcap_file:

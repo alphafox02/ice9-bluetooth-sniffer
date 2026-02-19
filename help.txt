@@ -17,8 +17,7 @@ Optional arguments:
     -v, --verbose           print detailed info about captured bursts
     -i IFACE                which SDR to use, example: hackrf-1234abcd
     -I, --install           install into Wireshark extcap folder
-    -Z, --zmq-pub=ENDPOINT  publish packets via ZMQ PUB bind (e.g. tcp://*:5555)
-    -X, --zmq-connect=ENDPOINT  publish via ZMQ PUB connect (collector mode)
+    -Z, --zmq=ENDPOINT      stream packets to collector (e.g. tcp://collector:5555)
     -K, --zmq-curve-key=FILE  enable CURVE encryption using key file
     -G, --gpsd              tag packets with GPS coordinates from gpsd
         --sensor-id=NAME    sensor identity for multi-sensor deployments
@@ -41,26 +40,25 @@ GPS tagging (requires libgps):
     Example:
         ice9-bluetooth -l -i usrp-... -C 40 --gpsd -w capture.pcap
     With ZMQ:
-        ice9-bluetooth -l ... --gpsd --zmq-pub tcp://*:5555
-        python3 tools/zmq_subscriber.py tcp://sensor:5555 -w output.pcap --gps
+        ice9-bluetooth -l ... --gpsd --zmq tcp://collector:5555
+        python3 tools/zmq_subscriber.py tcp://*:5555 -w output.pcap --gps
 
 ZMQ packet streaming (requires libzmq):
-    Publishes each captured BLE packet as a PCAP record over a ZMQ PUB socket.
-    Subscribers receive the standard PCAP packet header + BLE RF Info header +
-    payload. Use for distributed sensors, remote monitoring, or custom tooling.
-    Two modes:
-      --zmq-pub (bind):     sensor listens, subscribers connect to it
-      --zmq-connect (connect): sensor connects to a central collector
-    Example (sensor binds, subscriber connects):
-        ice9-bluetooth -l -i usrp-... -C 60 --zmq-pub tcp://*:5555
-        python3 tools/zmq_subscriber.py tcp://sensor:5555
-    Example (collector binds, sensors connect):
-        python3 tools/zmq_subscriber.py tcp://*:5555 --bind
-        ice9-bluetooth -l ... --zmq-connect tcp://collector:5555
-        ice9-bluetooth -l ... --zmq-connect tcp://collector:5555   # more sensors
+    Publishes each captured BLE/BT packet as a PCAP record over a ZMQ PUB socket.
+    Subscribers receive the standard PCAP packet header + RF Info header + payload.
+    Use for distributed sensors, remote monitoring, or custom tooling.
+
+    Sensors always connect out to a central collector (dashboard or subscriber).
+    The collector binds and receives data from one or more sensors. A C2 control
+    channel (DEALER/ROUTER) is automatically established on data_port + 1.
+
+    Example:
+        python3 tools/zmq_web_dashboard.py tcp://*:5555
+        ice9-bluetooth -l -c 2441 -C 40 --zmq tcp://collector:5555
+        ice9-bluetooth -l -c 2441 -C 40 --zmq tcp://collector:5555   # more sensors
     Encrypted:
         python3 tools/zmq_keygen.py server.key
-        ice9-bluetooth -l ... --zmq-pub tcp://*:5555 --zmq-curve-key server.key
+        ice9-bluetooth -l ... --zmq tcp://collector:5555 --zmq-curve-key server.key
 
 This tool also supports the Wireshark extcap interface:
     ice9-bluetooth --extcap-interfaces
